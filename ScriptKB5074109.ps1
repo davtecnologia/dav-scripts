@@ -1,21 +1,27 @@
 <# 
 .SYNOPSIS
-  Verifica a presença da KB5074109 e, se encontrada com evidência forte, remove.
-  Em ambos os casos, reinicia o computador em 30 segundos.
-  Gera log em C:\LogRemoveKB5074109.txt e registra no Event Viewer (Application).
+  Remoção segura do impacto associado à KB5074109 (Outlook Classic instável).
+  - Detecta KB5074109 via Get-HotFix
+  - Remove o pacote cumulativo (LCU/RollupFix) instalado correspondente via DISM /remove-package
+  - Pausa Windows Update por X dias SOMENTE se a remoção for bem-sucedida
+  - Log em C:\LogRemoveKB5074109.txt
+  - Event Viewer (Application) com Source próprio e EventId válido
+  - Reinicia em 30 segundos (em ambos os casos)
 
 .NOTES
   Execute como Administrador.
 #>
 
-$KbId         = "KB5074109"
-$KbNumber     = $KbId.Replace("KB","")
-$DelaySeconds = 30
-$LogPath      = "C:\LogRemoveKB5074109.txt"
+$TargetKbId    = "KB5074109"
+$DelaySeconds  = 30
+$LogPath       = "C:\LogRemoveKB5074109.txt"
 
-$EventSource  = "DAV-RemoveKB5074109"
-$EventLogName = "Application"
-$EventId      = 5074109
+# Pausa Windows Update (best-effort) - SOMENTE se remoção for bem-sucedida
+$PauseDays     = 7
+
+$EventSource   = "DAV-RemoveKB5074109"
+$EventLogName  = "Application"
+$EventId       = 54109  # precisa ser <= 65535
 
 function Write-Log {
     param(
@@ -28,6 +34,11 @@ function Write-Log {
     Write-Host $line
 }
 
+function Test-IsAdmin {
+    $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 function Ensure-EventSource {
     try {
         if (-not [System.Diagnostics.EventLog]::SourceExists($EventSource)) {
@@ -35,7 +46,6 @@ function Ensure-EventSource {
             Start-Sleep -Seconds 1
         }
     } catch {
-        # Se não conseguir criar source (policy), apenas loga em arquivo
         Write-Log -Message "Não foi possível criar/validar Event Source '$EventSource': $($_.Exception.Message)" -Level "WARN"
     }
 }
@@ -63,158 +73,212 @@ function Restart-WithMessage {
     shutdown.exe /r /t $Seconds /c $Message | Out-Null
 }
 
-function Test-IsAdmin {
-    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-function Detect-KB {
-    <#
-      Retorna um objeto com:
-        - IsInstalled (bool)
-        - Evidence (array de strings)
-    #>
-    $evidence = New-Object System.Collections.Generic.List[string]
-    $installed = $false
-
-    # 1) Get-HotFix
+function Get-OSBuildInfo {
     try {
-        $hf = Get-HotFix -Id $KbId -ErrorAction SilentlyContinue
-        if ($null -ne $hf) {
-            $installed = $true
-            $evidence.Add("Get-HotFix encontrou $KbId (InstalledOn: $($hf.InstalledOn)).")
-        } else {
-            $evidence.Add("Get-HotFix NÃO encontrou $KbId.")
+        $cv = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction Stop
+        return [pscustomobject]@{
+            DisplayVersion = $cv.DisplayVersion
+            CurrentBuild   = $cv.CurrentBuild
+            UBR            = $cv.UBR
+            BuildString    = "$($cv.CurrentBuild).$($cv.UBR)"
         }
     } catch {
-        $evidence.Add("Get-HotFix falhou: $($_.Exception.Message)")
-    }
-
-    # 2) Get-WindowsPackage -Online (DISM module) – nem sempre existe
-    try {
-        if (Get-Command Get-WindowsPackage -ErrorAction SilentlyContinue) {
-            # PackageName às vezes contém o KB; depende do tipo de pacote. Buscamos por KBNumber.
-            $pkgs = Get-WindowsPackage -Online -ErrorAction SilentlyContinue | Where-Object {
-                $_.PackageName -match $KbNumber -or $_.PackageName -match $KbId
-            }
-            if ($pkgs) {
-                $installed = $true
-                $sample = ($pkgs | Select-Object -First 1).PackageName
-                $evidence.Add("Get-WindowsPackage encontrou pacote relacionado (ex.: $sample).")
-            } else {
-                $evidence.Add("Get-WindowsPackage NÃO encontrou pacote relacionado ao $KbId.")
-            }
-        } else {
-            $evidence.Add("Cmdlet Get-WindowsPackage não disponível neste sistema.")
-        }
-    } catch {
-        $evidence.Add("Get-WindowsPackage falhou: $($_.Exception.Message)")
-    }
-
-    # 3) Fallback: dism.exe /online /get-packages
-    try {
-        $dismOut = & dism.exe /online /get-packages 2>$null
-        if ($LASTEXITCODE -eq 0 -and $dismOut) {
-            $match = $dismOut | Select-String -SimpleMatch $KbNumber -ErrorAction SilentlyContinue
-            if ($match) {
-                $installed = $true
-                $evidence.Add("dism.exe /get-packages encontrou referência ao $KbNumber.")
-            } else {
-                $evidence.Add("dism.exe /get-packages NÃO encontrou referência ao $KbNumber.")
-            }
-        } else {
-            $evidence.Add("dism.exe /get-packages não retornou saída válida (ExitCode: $LASTEXITCODE).")
-        }
-    } catch {
-        $evidence.Add("dism.exe falhou: $($_.Exception.Message)")
-    }
-
-    [pscustomobject]@{
-        IsInstalled = $installed
-        Evidence    = $evidence.ToArray()
+        return $null
     }
 }
 
-function Uninstall-KB {
-    <#
-      Retorna objeto com:
-        - ExitCode (int)
-        - Message (string)
-    #>
-    $args = "/uninstall /kb:$KbNumber /quiet /norestart"
-    Write-Log -Message "Executando: wusa.exe $args" -Level "INFO"
-
-    $proc = Start-Process -FilePath "wusa.exe" -ArgumentList $args -Wait -PassThru
-    $code = $proc.ExitCode
-
-    # Códigos comuns:
-    # 0     = sucesso (nem sempre)
-    # 3010  = sucesso, reinício necessário
-    # 2359302 = não aplicável
-    $msg = "WUSA finalizado. ExitCode: $code"
-
-    [pscustomobject]@{
-        ExitCode = $code
-        Message  = $msg
+function Get-InstalledHotFix {
+    param([Parameter(Mandatory=$true)][string]$KbId)
+    try {
+        return Get-HotFix -Id $KbId -ErrorAction SilentlyContinue
+    } catch {
+        return $null
     }
 }
 
-# Cabeçalho do log
+function Get-DismPackagesTable {
+    try {
+        $out = & dism.exe /online /get-packages /format:table 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $out) { return $null }
+        return $out
+    } catch { 
+        return $null 
+    }
+}
+
+function Find-LatestInstalledRollupFixPackage {
+    param([string[]]$DismTableLines)
+
+    if (-not $DismTableLines) { return $null }
+
+    $candidates = @()
+    foreach ($line in $DismTableLines) {
+        if ($line -match "Package_for_RollupFix" -and ($line -match "\|\s*Instalado\s*\|" -or $line -match "\|\s*Installed\s*\|")) {
+            $parts = $line -split "\|"
+            if ($parts.Count -ge 4) {
+                $pkg  = $parts[0].Trim()
+                $time = $parts[3].Trim()
+                $dt = $null
+
+                try { $dt = [datetime]::Parse($time, (Get-Culture "pt-BR")) } catch {}
+                if (-not $dt) { try { $dt = [datetime]::Parse($time) } catch {} }
+
+                $candidates += [pscustomobject]@{
+                    PackageName    = $pkg
+                    InstallTime    = $dt
+                    InstallTimeRaw = $time
+                    Line           = $line.Trim()
+                }
+            }
+        }
+    }
+
+    if (-not $candidates -or $candidates.Count -eq 0) { return $null }
+
+    $sorted = $candidates | Sort-Object @{Expression="InstallTime";Descending=$true}, @{Expression="InstallTimeRaw";Descending=$true}
+    return $sorted | Select-Object -First 1
+}
+
+function Remove-PackageWithDism {
+    param([Parameter(Mandatory=$true)][string]$PackageName)
+
+    $args = "/online /remove-package /packagename:$PackageName /quiet /norestart"
+    Write-Log -Message "Executando: dism.exe $args" -Level "INFO"
+
+    & dism.exe $args | Out-Null
+    $code = $LASTEXITCODE
+
+    Write-Log -Message "DISM finalizado. ExitCode: $code" -Level "INFO"
+    return $code
+}
+
+function Validate-PackageState {
+    param([Parameter(Mandatory=$true)][string]$PackageName)
+    $table = Get-DismPackagesTable
+    if (-not $table) { return $null }
+
+    $line = $table | Where-Object { $_ -match [regex]::Escape($PackageName) } | Select-Object -First 1
+    return $line
+}
+
+function Pause-WindowsUpdate {
+    param([int]$Days = 7)
+
+    try {
+        $pauseStart = Get-Date
+        $pauseEnd   = $pauseStart.AddDays($Days)
+
+        # Formato ISO 8601
+        $startStr = $pauseStart.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $endStr   = $pauseEnd.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+        $regPath = "HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings"
+
+        Write-Log -Message "Tentando pausar Windows Update por $Days dias (best-effort)..." -Level "INFO"
+        Write-Log -Message "Pause Start(UTC): $startStr | Pause End(UTC): $endStr" -Level "INFO"
+
+        if (-not (Test-Path $regPath)) {
+            New-Item -Path $regPath -Force | Out-Null
+        }
+
+        New-ItemProperty -Path $regPath -Name "PauseUpdatesStartTime"        -Value $startStr -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $regPath -Name "PauseUpdatesExpiryTime"       -Value $endStr   -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $regPath -Name "PauseFeatureUpdatesStartTime" -Value $startStr -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $regPath -Name "PauseFeatureUpdatesEndTime"   -Value $endStr   -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $regPath -Name "PauseQualityUpdatesStartTime" -Value $startStr -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $regPath -Name "PauseQualityUpdatesEndTime"   -Value $endStr   -PropertyType String -Force | Out-Null
+
+        # Tenta "refrescar" o serviço (best-effort; pode ser bloqueado por política)
+        try {
+            Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            Start-Service wuauserv -ErrorAction SilentlyContinue
+        } catch {}
+
+        Write-Log -Message "Windows Update pausado por $Days dias (best-effort). Políticas corporativas podem reverter." -Level "INFO"
+        Write-Event -Message "Windows Update pausado por $Days dias (best-effort). Pode ser revertido por política corporativa." -EntryType "Warning"
+        return $true
+    }
+    catch {
+        Write-Log -Message "Falha ao pausar Windows Update: $($_.Exception.Message)" -Level "WARN"
+        Write-Event -Message "Falha ao pausar Windows Update: $($_.Exception.Message)" -EntryType "Warning"
+        return $false
+    }
+}
+
+# ===================== INÍCIO =====================
+
 "=============================================================" | Out-File -FilePath $LogPath -Append -Encoding UTF8
 "Inicio - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"            | Out-File -FilePath $LogPath -Append -Encoding UTF8
 "Usuario: $env:USERNAME | Computador: $env:COMPUTERNAME"        | Out-File -FilePath $LogPath -Append -Encoding UTF8
-"OS: $([Environment]::OSVersion.VersionString)"                 | Out-File -FilePath $LogPath -Append -Encoding UTF8
 "=============================================================" | Out-File -FilePath $LogPath -Append -Encoding UTF8
 
 try {
     if (-not (Test-IsAdmin)) {
-        Write-Log   -Message "Script não executado como Administrador. Abortando." -Level "ERROR"
+        Write-Log -Message "Script não executado como Administrador. Abortando." -Level "ERROR"
         Write-Event -Message "Script não executado como Administrador. Abortando." -EntryType "Error"
         throw "Permissão insuficiente. Execute o PowerShell como Administrador."
     }
 
-    Write-Log -Message "Iniciando detecção da $KbId..." -Level "INFO"
-    $det = Detect-KB
-
-    foreach ($ev in $det.Evidence) {
-        Write-Log -Message $ev -Level "INFO"
+    $os = Get-OSBuildInfo
+    if ($os) {
+        Write-Log -Message "Windows: DisplayVersion=$($os.DisplayVersion) Build=$($os.BuildString)" -Level "INFO"
     }
 
-    if ($det.IsInstalled) {
-        Write-Log -Message "$KbId CONFIRMADA como instalada (evidência forte). Prosseguindo com remoção." -Level "INFO"
-        Write-Event -Message "$KbId confirmada como instalada. Iniciando remoção." -EntryType "Warning"
+    Write-Log -Message "Verificando presença da $TargetKbId..." -Level "INFO"
+    $hf = Get-InstalledHotFix -KbId $TargetKbId
 
-        $un = Uninstall-KB
-        Write-Log -Message $un.Message -Level "INFO"
+    if (-not $hf) {
+        Write-Log -Message "$TargetKbId NÃO encontrada. Nenhuma remoção será realizada." -Level "WARN"
+        Restart-WithMessage -Message "ATUALIZAÇÃO NÃO ENCONTRADA. REINICIANDO EM 30 SEGUNDOS..." -Seconds $DelaySeconds
+        return
+    }
 
-        # Validação pós-remoção (antes do reboot)
-        Write-Log -Message "Validando presença da KB após tentativa de remoção..." -Level "INFO"
-        $post = Detect-KB
-        $stillThere = $post.IsInstalled
+    Write-Log -Message "$TargetKbId encontrada (InstalledOn: $($hf.InstalledOn))." -Level "INFO"
+    Write-Event -Message "$TargetKbId encontrada. Iniciando procedimento de remoção controlada (LCU/RollupFix via DISM)." -EntryType "Warning"
 
-        if (-not $stillThere -and ($un.ExitCode -eq 0 -or $un.ExitCode -eq 3010 -or $un.ExitCode -eq 2359302)) {
-            # Mesmo com 2359302, se a validação pós não vê a KB, consideramos ok
-            Restart-WithMessage -Message "ATUALIZAÇÃO REMOVIDA COM SUCESSO. REINICIANDO EM 30 SEGUNDOS..." -Seconds $DelaySeconds
+    $dismTable = Get-DismPackagesTable
+    if (-not $dismTable) {
+        Write-Log -Message "Falha ao obter lista de pacotes via DISM. Não é seguro prosseguir." -Level "ERROR"
+        Restart-WithMessage -Message "FALHA AO CONSULTAR DISM. REINICIANDO EM 30 SEGUNDOS..." -Seconds $DelaySeconds
+        return
+    }
+
+    $rollup = Find-LatestInstalledRollupFixPackage -DismTableLines $dismTable
+    if (-not $rollup) {
+        Write-Log -Message "Não foi encontrado pacote Package_for_RollupFix com estado 'Instalado/Installed'. Não é seguro prosseguir." -Level "ERROR"
+        Restart-WithMessage -Message "KB DETECTADA, MAS LCU INSTALADA NÃO FOI IDENTIFICADA COM SEGURANÇA. REINICIANDO EM 30 SEGUNDOS..." -Seconds $DelaySeconds
+        return
+    }
+
+    Write-Log -Message "LCU selecionada para remoção (mais recente Instalado):" -Level "INFO"
+    Write-Log -Message "  Package: $($rollup.PackageName)" -Level "INFO"
+    Write-Log -Message "  InstallTime: $($rollup.InstallTimeRaw)" -Level "INFO"
+    Write-Log -Message "  Linha DISM: $($rollup.Line)" -Level "INFO"
+
+    $exit = Remove-PackageWithDism -PackageName $rollup.PackageName
+
+    if ($exit -eq 0 -or $exit -eq 3010) {
+        $postLine = Validate-PackageState -PackageName $rollup.PackageName
+        if ($postLine) {
+            Write-Log -Message "Pós-remoção (antes do reboot), estado atual na tabela DISM:" -Level "INFO"
+            Write-Log -Message "  $postLine" -Level "INFO"
+        } else {
+            Write-Log -Message "Pós-remoção (antes do reboot), pacote não localizado na tabela DISM (pode ser esperado)." -Level "INFO"
         }
-        elseif ($un.ExitCode -eq 3010) {
-            # Sucesso, mas validação pode ser inconsistente; ainda assim reiniciar
-            Restart-WithMessage -Message "ATUALIZAÇÃO REMOVIDA (REINÍCIO NECESSÁRIO). REINICIANDO EM 30 SEGUNDOS..." -Seconds $DelaySeconds
-        }
-        else {
-            # Falha/ambiguidade: reinicia (conforme solicitado), mas deixa claro no log
-            Write-Log -Message "A remoção não pôde ser confirmada com segurança (ExitCode: $($un.ExitCode))." -Level "WARN"
-            foreach ($ev in $post.Evidence) { Write-Log -Message "Pós-validação: $ev" -Level "INFO" }
-            Restart-WithMessage -Message "FALHA OU INDETERMINADO AO REMOVER $KbId. REINICIANDO EM 30 SEGUNDOS..." -Seconds $DelaySeconds
-        }
+
+        # Pausa SOMENTE se remoção foi bem-sucedida
+        Pause-WindowsUpdate -Days $PauseDays | Out-Null
+
+        Restart-WithMessage -Message "ATUALIZAÇÃO REMOVIDA COM SUCESSO. REINICIANDO EM 30 SEGUNDOS..." -Seconds $DelaySeconds
     }
     else {
-        Write-Log -Message "$KbId não encontrada com evidência suficiente. Não será removida." -Level "WARN"
-        Restart-WithMessage -Message "ATUALIZAÇÃO NÃO ENCONTRADA. REINICIANDO EM 30 SEGUNDOS..." -Seconds $DelaySeconds
+        Write-Log -Message "Falha ao remover pacote via DISM. ExitCode: $exit" -Level "ERROR"
+        Restart-WithMessage -Message "FALHA AO REMOVER ATUALIZAÇÃO (DISM ExitCode: $exit). REINICIANDO EM 30 SEGUNDOS..." -Seconds $DelaySeconds
     }
 }
 catch {
-    Write-Log   -Message "Exceção: $($_.Exception.Message)" -Level "ERROR"
-    Write-Event -Message "Exceção: $($_.Exception.Message)" -EntryType "Error"
+    Write-Log -Message "Exceção: $($_.Exception.Message)" -Level "ERROR"
     Restart-WithMessage -Message "ERRO AO EXECUTAR O SCRIPT. REINICIANDO EM 30 SEGUNDOS..." -Seconds $DelaySeconds
 }
 finally {
