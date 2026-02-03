@@ -1,9 +1,10 @@
 <# 
-  ScriptKB5074109.ps1 (v5)
+  ScriptKB5074109.ps1 (v5.2)
   - Detecta KB5074109 (Get-HotFix)
   - Identifica LCU RollupFix instalada mais recente (DISM /get-packages)
   - Remove via DISM usando Start-Process (mais confiável) e packagename entre aspas
   - Pausa Windows Update SOMENTE se a remoção for bem-sucedida
+  - Pausa configurada por DATA LIMITE fixa (editar manualmente no futuro)
   - Log: C:\LogRemoveKB5074109.txt
   - Reinicia em 30 segundos
 #>
@@ -11,7 +12,10 @@
 $TargetKbId    = "KB5074109"
 $DelaySeconds  = 30
 $LogPath       = "C:\LogRemoveKB5074109.txt"
-$PauseDays     = 7
+
+# >>> ALTERAÇÃO: Defina aqui a DATA LIMITE (edite manualmente quando quiser)
+# Formatos aceitos: "YYYY-MM-DD" ou "YYYY-MM-DD HH:mm"
+$PauseUntil    = [datetime]"2026-06-03 23:59"
 
 $EventSource   = "DAV-RemoveKB5074109"
 $EventLogName  = "Application"
@@ -131,16 +135,25 @@ function Remove-PackageWithDism {
     return $p.ExitCode
 }
 
+# >>> ALTERAÇÃO: Pause por DATA LIMITE fixa
 function Pause-WindowsUpdate {
-    param([int]$Days = 7)
+    param([datetime]$Until)
+
     try {
         $pauseStart = Get-Date
-        $pauseEnd   = $pauseStart.AddDays($Days)
+
+        if ($Until -le $pauseStart) {
+            Write-Log "PAUSA NÃO APLICADA: a data limite ($Until) é <= agora ($pauseStart)." "WARN"
+            return $false
+        }
+
         $startStr = $pauseStart.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-        $endStr   = $pauseEnd.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $endStr   = $Until.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
         $regPath = "HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings"
 
-        Write-Log "Pausando Windows Update por $Days dias (best-effort)..." "INFO"
+        Write-Log "Pausando Windows Update até $Until (best-effort)." "INFO"
+        Write-Log "Pause Start(UTC): $startStr | Pause End(UTC): $endStr" "INFO"
 
         if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
 
@@ -151,8 +164,8 @@ function Pause-WindowsUpdate {
         New-ItemProperty -Path $regPath -Name "PauseQualityUpdatesStartTime" -Value $startStr -PropertyType String -Force | Out-Null
         New-ItemProperty -Path $regPath -Name "PauseQualityUpdatesEndTime"   -Value $endStr   -PropertyType String -Force | Out-Null
 
-        Write-Log "Windows Update pausado por $Days dias (best-effort). Políticas corporativas podem reverter." "INFO"
-        Write-Event "Windows Update pausado por $Days dias (best-effort). Pode ser revertido por política corporativa." "Warning"
+        Write-Log "Windows Update pausado até (UTC): $endStr (best-effort). Políticas/limites do Windows podem reverter." "INFO"
+        Write-Event "Windows Update pausado até $Until (best-effort). Pode ser revertido por política/limites do Windows." "Warning"
         return $true
     } catch {
         Write-Log "Falha ao pausar Windows Update: $($_.Exception.Message)" "WARN"
@@ -207,7 +220,7 @@ try {
     $exit = Remove-PackageWithDism -PackageName $rollup.PackageName
 
     if ($exit -eq 0 -or $exit -eq 3010) {
-        Pause-WindowsUpdate -Days $PauseDays | Out-Null
+        Pause-WindowsUpdate -Until $PauseUntil | Out-Null
         Restart-WithMessage "ATUALIZAÇÃO REMOVIDA COM SUCESSO. REINICIANDO EM 30 SEGUNDOS..." $DelaySeconds
     } else {
         Write-Log "Falha ao remover pacote via DISM. ExitCode: $exit" "ERROR"
